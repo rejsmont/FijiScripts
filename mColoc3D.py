@@ -1,8 +1,8 @@
 import os
 
 from javax.swing import (BoxLayout, ImageIcon, JButton, JFrame, JPanel,
-        JPasswordField, JLabel, JTextArea, JTextField, JScrollPane, JList,
-        DefaultListCellRenderer,
+        JPasswordField, JLabel, JTextArea, JTextField, JScrollPane,
+        JList, JCheckBox, DefaultListCellRenderer,
         ListSelectionModel, SwingConstants, WindowConstants)
 from java.awt import Component, GridBagLayout, GridBagConstraints, Insets, Color
 from java.awt.event import WindowEvent, WindowAdapter
@@ -13,7 +13,7 @@ from ij import IJ, ImagePlus, ImageStack, ImageListener
 from ij.io import DirectoryChooser, FileSaver
 from ij.gui import Roi, ShapeRoi, GenericDialog
 from ij.measure import ResultsTable
-from ij.plugin import Duplicator, ChannelSplitter, RGBStackMerge, ContrastEnhancer
+from ij.plugin import Duplicator, ChannelSplitter, RGBStackMerge, ContrastEnhancer, ZProjector
 from ij.process import StackProcessor
 from loci.plugins import BF
 from loci.formats import UnknownFormatException
@@ -36,6 +36,7 @@ class MandersPlugin(ImageListener, WindowAdapter):
 
 	def __init__(self):
 		self.imp = None
+		self.preview = None
 		self.createMainWindow()
 		self.cells = None
 		self.files = []
@@ -48,6 +49,7 @@ class MandersPlugin(ImageListener, WindowAdapter):
 		self.methodA = None
 		self.methodB = None
 		self.processNextFile()
+		
 
 	def selectInputDir(self):
 		inputDialog = DirectoryChooser("Please select a directory contaning your images")
@@ -63,6 +65,9 @@ class MandersPlugin(ImageListener, WindowAdapter):
 		if self.imp is not None:
 			self.imp.close()
 			self.imp = None
+		if self.preview is not None:
+			self.preview.close()
+			self.preview = None
 
 	def openImage(self, imageFile):
 		try:
@@ -114,12 +119,17 @@ class MandersPlugin(ImageListener, WindowAdapter):
 			self.cells = DelegateListModel([])
 			self.cells.append(cell)
 			self.showMainWindow(self.cells)
-			self.displayImage(imp)
+			if self.checkbox3D.isSelected():
+				self.displayImage(imp)
+			else:
+				self.displayImage(imp, False)
+				self.preview = self.previewImage(imp)
+				self.displayImage(self.preview)
 			return True
 		else:
 			return self.processNextFile()
 	
-	def displayImage(self, imp):
+	def displayImage(self, imp, show = True):
 		imp.setDisplayMode(IJ.COMPOSITE)
 		enhancer = ContrastEnhancer()
 		enhancer.setUseStackHistogram(True)
@@ -127,25 +137,49 @@ class MandersPlugin(ImageListener, WindowAdapter):
 		for c in range(1, imp.getNChannels() + 1):
 			imp.c = c
 			enhancer.stretchHistogram(imp, 0.35)
-		imp.show()
+		if show:
+			imp.show()
+
+	def previewImage(self, imp):
+		roi = imp.getRoi()
+		splitter = ChannelSplitter()
+		channels = []
+		for c in range(1, imp.getNChannels() + 1):
+			channel = ImagePlus("Channel %i" % c, splitter.getChannel(imp, c))
+			projector = ZProjector(channel)
+			projector.setMethod(ZProjector.MAX_METHOD)
+			projector.doProjection()
+			channels.append(projector.getProjection())
+		image = RGBStackMerge.mergeChannels(channels, False)
+		image.title = imp.title + " MAX Intensity"
+		image.luts = imp.luts
+		imp.setRoi(roi)
+		return image
 
 	def getCroppedChannels(self, imp, cell):
 		splitter = ChannelSplitter()
 		imp.setRoi(None)
-		cropRoi = cell.getCropRoi()
+		if cell.mode3D:
+			cropRoi = cell.getCropRoi()
+		else:
+			cropRoi = cell.roi
 		if cropRoi is None:
 			return None
 		crop = cropRoi.getBounds()
 		channels = []
-		for c in range(1, imp.getNChannels() + 1):			
+		for c in range(1, imp.getNChannels() + 1):
 			slices = ImageStack(crop.width, crop.height)
 			channel = splitter.getChannel(imp, c)
 			for z in range(1, channel.getSize() + 1):
 				zslice = channel.getProcessor(z)
 				zslice.setRoi(cropRoi)
 				nslice = zslice.crop()
-				if cell.slices[z - 1].roi is not None:
-					roi = cell.slices[z - 1].roi.clone()
+				if cell.mode3D:
+					oroi = cell.slices[z - 1].roi	
+				else:
+					oroi = cell.roi
+				if oroi is not None:
+					roi = oroi.clone()
 					bounds = roi.getBounds()
 					roi.setLocation(bounds.x - crop.x, bounds.y - crop.y)
 					nslice.setColor(Color.black)
@@ -193,7 +227,6 @@ class MandersPlugin(ImageListener, WindowAdapter):
 		saver = FileSaver(tmp)
 		saver.saveAsTiffStack(self.outputDir + title + ".tif")
 		tmp.close()
-		
 
 	def createMainWindow(self):
 		self.frame = JFrame('Select cells and ROIs',
@@ -262,6 +295,13 @@ class MandersPlugin(ImageListener, WindowAdapter):
 				Insets(0, 0, 0, 0), 0, 0
 		))
 
+		self.checkbox3D = JCheckBox('3D selection mode', True, actionPerformed=self.toggle3D)
+		self.frame.add(self.checkbox3D,
+			GridBagConstraints(0, 13, 2, 1, 0, 1,
+				GridBagConstraints.WEST, GridBagConstraints.NONE,
+				Insets(0, 0, 0, 0), 0, 0
+		))
+
 	def showMainWindow(self, cells = None):
 		if cells is not None:
 			self.cellList.model = cells
@@ -276,6 +316,29 @@ class MandersPlugin(ImageListener, WindowAdapter):
 	def closeMainWindow(self):
 		self.frame.dispose()
 
+	def toggle3D(self, event):
+		mode3D = self.checkbox3D.isSelected()
+		if mode3D:
+			self.sliceList.enabled = True
+			if self.imp is not None:
+				self.imp.show()
+			if self.preview is not None:
+				self.preview.hide()
+		else:
+			self.sliceList.enabled = False
+			if self.preview is None:
+				self.preview = self.previewImage(self.imp)
+				self.displayImage(self.preview)
+			else:
+				self.preview.show()
+			if self.imp is not None:
+				self.imp.hide()
+		selectedCell = self.cellList.selectedIndex
+		if selectedCell >= 0:
+			cell = self.cells[selectedCell]
+			self.sliceList.model = cell.slices
+			self.sliceList.selectedIndex = 0
+		
 	def addCell(self, event):
 		size = len(self.cells)
 		if (size > 0):
@@ -303,6 +366,8 @@ class MandersPlugin(ImageListener, WindowAdapter):
 			self.sliceList.selectedIndex = 0
 		else:
 			self.sliceList.model = DelegateListModel([])
+		if self.preview is not None:
+			self.preview.setRoi(cell.roi)
 
 	def selectSlice(self, event):
 		selectedCell = self.cellList.selectedIndex
@@ -310,29 +375,50 @@ class MandersPlugin(ImageListener, WindowAdapter):
 		if selectedCell >= 0 and selectedSlice >= 0:
 			cell = self.cells[selectedCell]
 			image = self.imp
-			if image is not None and cell is not None:
+			mode3D = self.checkbox3D.isSelected()
+			if image is not None and cell is not None and mode3D:
 				roi = cell.slices[selectedSlice].roi
 				if (image.z - 1 != selectedSlice):
 					image.z = selectedSlice + 1				
 				image.setRoi(roi, True)
+			if self.preview is not None and not mode3D:
+				self.preview.setRoi(cell.roi, True)
 
 	def updateSlice(self, event):
+		if self.checkbox3D.isSelected():
+			self.updateSlice3D(self.imp)
+		else:
+			self.updateSlice2D(self.preview)
+
+	def updateSlice3D(self, imp):
 		selectedCell = self.cellList.selectedIndex
 		selectedSlice = self.sliceList.selectedIndex
-		if selectedCell >= 0  and selectedSlice >= 0:
+		if selectedCell >= 0 and selectedSlice >= 0 and imp is not None:
 			cell = self.cells[selectedCell]
-			image = self.imp
-			if image is not None and cell is not None:
-				imageRoi = image.getRoi()
-				if imageRoi is not None:
-					index = selectedSlice + 1
-					roi = ShapeRoi(imageRoi, position = index)
-					cell.slices[selectedSlice].roi = roi
-					if (index + 1 <= len(cell.slices)):
-						image.z = index + 1
+			impRoi = imp.getRoi()
+			if cell is not None and impRoi is not None:
+				index = selectedSlice + 1
+				roi = ShapeRoi(impRoi, position = index)
+				cell.mode3D = True
+				cell.name = "Cell %i (3D)" % cell.n
+				cell.slices[selectedSlice].roi = roi
+				if (index + 1 <= len(cell.slices)):
+					imp.z = index + 1			
 			self.cellList.repaint(self.cellList.getCellBounds(selectedCell, selectedCell))
 			self.sliceList.repaint(self.sliceList.getCellBounds(selectedSlice, selectedSlice))
-		
+
+	def updateSlice2D(self, imp):
+		selectedCell = self.cellList.selectedIndex
+		if selectedCell >= 0 and imp is not None:
+			cell = self.cells[selectedCell]
+			impRoi = imp.getRoi()
+			if cell is not None and impRoi is not None:
+				roi = ShapeRoi(impRoi, position = 1)
+				cell.mode3D = False
+				cell.name = "Cell %i (2D)" % cell.n
+				cell.roi = roi	
+			self.cellList.repaint(self.cellList.getCellBounds(selectedCell, selectedCell))
+	
 	def imageOpened(self, imp):
 		pass
 
@@ -340,11 +426,12 @@ class MandersPlugin(ImageListener, WindowAdapter):
 		pass
 
 	def imageUpdated(self, imp):
-		if imp is not None:
-			selectedCell = self.cellList.selectedIndex
-			selectedSlice = imp.z - 1
-		if imp == self.imp and selectedSlice != self.sliceList.selectedIndex:
-			self.sliceList.selectedIndex = selectedSlice
+		if self.checkbox3D.isSelected():
+			if imp is not None:
+				selectedCell = self.cellList.selectedIndex
+				selectedSlice = imp.z - 1
+			if imp == self.imp and selectedSlice != self.sliceList.selectedIndex:
+				self.sliceList.selectedIndex = selectedSlice
 
 	def doneSelecting(self, event):
 		oluts = self.imp.luts
@@ -386,11 +473,13 @@ class MandersPlugin(ImageListener, WindowAdapter):
 
 class Cell(object):
 
-	def __init__(self, nslices, n):
+	def __init__(self, nslices, n, mode3D = True):
 		self.n = n
+		self.roi = None
 		self.slices = DelegateListModel([])
 		self.initSlices(nslices)
-		self.name = "Cell %i" % self.n
+		self.name = "Cell %i (none)" % self.n
+		self.mode3D = mode3D
 	
 	def initSlices(self, nslices):
 		for i in range(1, nslices + 1):
@@ -398,15 +487,19 @@ class Cell(object):
 			self.slices.append(aslice)
 
 	def isDefined(self):
-		size = len(self.slices)
-		if size <= 0:
-			return False
-		for i in range(0, size):
-			aslice = self.slices[i]
-			if not aslice.isDefined():
+		if self.mode3D:
+			size = len(self.slices)
+			if size <= 0:
+				return False
+			for i in range(0, size):
+				aslice = self.slices[i]
+				if not aslice.isDefined():
+					return False
+		else:
+			if self.roi is None:
 				return False
 		return True
-
+			
 	def getCropRoi(self):
 		crop = None
 		for aslice in self.slices:
