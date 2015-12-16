@@ -1,4 +1,4 @@
-import os
+import os, sys
 
 from javax.swing import (BoxLayout, ImageIcon, JButton, JFrame, JPanel,
         JPasswordField, JLabel, JTextArea, JTextField, JScrollPane,
@@ -44,12 +44,9 @@ class MandersPlugin(ImageListener, WindowAdapter):
 		ImagePlus.addImageListener(self)
 		self.selectInputDir()
 		self.selectOutputDir()
-		self.channelA = None
-		self.channelB = None
-		self.methodA = None
-		self.methodB = None
+		self.pairs = []
+		self.methods = []
 		self.processNextFile()
-		
 
 	def selectInputDir(self):
 		inputDialog = DirectoryChooser("Please select a directory contaning your images")
@@ -78,32 +75,31 @@ class MandersPlugin(ImageListener, WindowAdapter):
 		if self.imp.getNChannels() < 2:
 			IJ.error("Bad image format", "Image must contain at lease 2 channels!")
 			return None
-		if self.channelA is None or \
-			self.channelB is None or \
-			self.methodA is None or \
-			self.methodB is None:
+		if not self.pairs or \
+			not self.methods:
 			self.getOptionsDialog(self.imp)
 		title = self.imp.title
 		self.imp.title = title[:title.rfind('.')]
 		return self.imp
 
 	def getOptionsDialog(self, imp):
-		channels = []
-		methods = ["Default", "Huang", "Intermodes", "IsoData",  "Li", "MaxEntropy","Mean", "MinError(I)", "Minimum", "Moments", "Otsu", "Percentile", "RenyiEntropy", "Shanbhag" , "Triangle", "Yen"]
+		thr_methods = ["None", "Default", "Huang", "Intermodes", "IsoData",  "Li", "MaxEntropy","Mean", "MinError(I)", "Minimum", "Moments", "Otsu", "Percentile", "RenyiEntropy", "Shanbhag" , "Triangle", "Yen"]
+		gd = GenericDialog("Please select channels to collocalize")
 		for i in range(1, imp.getNChannels() + 1):
-			channels.append("Channel %i" % i)
-		gd = GenericDialog("Please set some options")
-		gd.addChoice("Channel A", channels, defaultChannelA)
-		gd.addChoice("Channel B", channels, defaultChannelB)
-		gd.addChoice("Threshold method A", methods, defaultMethodA)
-		gd.addChoice("Threshold method B", methods, defaultMethodB)
+			gd.addChoice("Threshold method for channel %i" % i, thr_methods, "None")
 		gd.showDialog()
 		if gd.wasCanceled():
 			self.exit()
-		self.channelA = channels.index(gd.getNextChoice())
-		self.channelB = channels.index(gd.getNextChoice())
-		self.methodA = gd.getNextChoice()
-		self.methodB = gd.getNextChoice()
+		channels = []
+		for i in range(1, imp.getNChannels() + 1):
+			method = gd.getNextChoice()
+			self.methods.append(method)
+			if method != "None":
+				channels.append(i)
+		for x in channels:
+			for y in channels:
+				if x < y:
+					self.pairs.append((x, y))
 
 	def processNextFile(self):
 		if self.files:
@@ -199,27 +195,46 @@ class MandersPlugin(ImageListener, WindowAdapter):
 		imgB = ImagePlusAdapter.wrap(impB)
 		return DataContainer(imgA, imgB, 1, 1, "imageA", "imageB")
 
-	def getManders(self, imp, cell, chA, chB, methodA, methodB):
+	def getManders(self, imp, cell):
+	
+		### Crop channels according to cell mask
 		channels = self.getCroppedChannels(imp, cell)
 		if channels is None:
 			return None
+			
+		### Calculate channel thresholds
+		thrs = []
+		thrimps = []
+		for c, method in enumerate(self.methods):
+			if method != "None":
+				thr, thrimp = self.getThreshold(channels[c], method)
+			else:
+				thr, thrimp = None, None
+			thrs.append(thr)
+			thrimps.append(thrimp)
+		
+		### Calculate manders colocalization
 		manders = MandersColocalization()
-		container = self.getContainer(channels[chA], channels[chB])
-		img1 = container.getSourceImage1()
-		img2 = container.getSourceImage2()
-		mask = container.getMask()
-		thr1, thrimp1 = self.getThreshold(channels[chA], methodA)
-		thr2, thrimp2 = self.getThreshold(channels[chB], methodB)
-		cursor = TwinCursor(img1.randomAccess(), img2.randomAccess(), Views.iterable(mask).localizingCursor())
-		rtype = img1.randomAccess().get().createVariable()
-		raw = manders.calculateMandersCorrelation(cursor, rtype)
-		rthr1 = rtype.copy()
-		rthr2 = rtype.copy()
-		rthr1.set(thr1)
-		rthr2.set(thr2)
-		cursor.reset()
-		thrd = manders.calculateMandersCorrelation(cursor, rthr1, rthr2, ThresholdMode.Above)
-		return (channels, [thrimp1, thrimp2], [thr1, thr2], raw, thrd)
+		raws = []
+		thrds = []
+		for chA, chB in self.pairs:
+			container = self.getContainer(channels[chA - 1], channels[chB - 1])
+			img1 = container.getSourceImage1()
+			img2 = container.getSourceImage2()
+			mask = container.getMask()
+			cursor = TwinCursor(img1.randomAccess(), img2.randomAccess(), Views.iterable(mask).localizingCursor())
+			rtype = img1.randomAccess().get().createVariable()
+			raw = manders.calculateMandersCorrelation(cursor, rtype)
+			rthr1 = rtype.copy()
+			rthr2 = rtype.copy()
+			rthr1.set(thrs[chA - 1])
+			rthr2.set(thrs[chB - 1])
+			cursor.reset()
+			thrd = manders.calculateMandersCorrelation(cursor, rthr1, rthr2, ThresholdMode.Above)
+			raws.append(raw)
+			thrds.append(thrd)
+		
+		return (channels, thrimps, thrs, raws, thrds)
 
 	def saveMultichannelImage(self, title, channels, luts):
 		tmp = RGBStackMerge.mergeChannels(channels, False)
@@ -436,12 +451,15 @@ class MandersPlugin(ImageListener, WindowAdapter):
 	def doneSelecting(self, event):
 		oluts = self.imp.luts
 		luts = []
-		luts.append(oluts[self.channelA])
-		luts.append(oluts[self.channelB])
+		channels = []
+		for c, method in enumerate(self.methods):
+			if method != "None":
+				luts.append(oluts[c])
+				channels.append(c)
 		for cell in self.cells:
-			manders = self.getManders(self.imp, cell, self.channelA, self.channelB, self.methodA, self.methodB)
+			manders = self.getManders(self.imp, cell)
 			if manders is not None:
-				chimps, thrimps, thrs, raw, thrd = manders
+				chimps, thrimps, thrs, raws, thrds = manders
 				index = self.cells.index(cell) + 1
 				title = "Cell_%i-" % index + self.imp.title
 				self.saveMultichannelImage(title, chimps, oluts)
@@ -449,12 +467,14 @@ class MandersPlugin(ImageListener, WindowAdapter):
 				self.saveMultichannelImage(title, thrimps, luts)
 				self.results.incrementCounter()
 				row = self.results.getCounter() - 1
-				self.results.setValue("Threshold 1", row, int(thrs[0]))
-				self.results.setValue("Threshold 2", row, int(thrs[1]))
-				self.results.setValue("M1 raw", row, float(raw.m1))
-				self.results.setValue("M2 raw", row, float(raw.m2))
-				self.results.setValue("M1 thrd", row, float(thrd.m1))
-				self.results.setValue("M2 thrd", row, float(thrd.m2))
+				for i, thr in enumerate(thrs):
+					if thr is not None:
+						self.results.setValue("Threshold %i" % (i + 1), row, int(thr))
+				for i, pair in enumerate(self.pairs):
+					self.results.setValue("%i-%i M1 raw" % pair, row, float(raws[i].m1))
+					self.results.setValue("%i-%i M2 raw" % pair, row, float(raws[i].m2))
+					self.results.setValue("%i-%i M1 thrd" % pair, row, float(thrds[i].m1))
+					self.results.setValue("%i-%i M2 thrd" % pair, row, float(thrds[i].m2))
 		self.closeImage()
 		if not self.processNextFile():
 			print "All done - happy analysis!"
